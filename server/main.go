@@ -2,9 +2,12 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"sync"
-	"io"
+
+	"github.com/vsevolodhp/toy-kv-store/server/logging"
 )
 
 type server struct {
@@ -19,7 +22,7 @@ func newServer() *server {
 }
 
 func main() {
-	fmt.Println("starting toy-kv server")
+	slog.Info("starting toy-kv server")
 	s := newServer()
 
 	mux := http.NewServeMux()
@@ -27,7 +30,8 @@ func main() {
 	mux.HandleFunc("PUT /{key}", s.handlePut())
 	mux.HandleFunc("DELETE /{key}", s.handleDelete())
 
-	_ = http.ListenAndServe(":8080", mux)
+	wrapped := logging.NewLogger(mux)
+	_ = http.ListenAndServe(":8080", wrapped)
 }
 
 func (s *server) handleGet() func(http.ResponseWriter, *http.Request) {
