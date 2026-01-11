@@ -4,12 +4,12 @@ import (
 	"bufio"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
-
-const baseUrl = "http://localhost:8080/"
 
 type reqTemplate struct {
 	method  string
@@ -19,7 +19,6 @@ type reqTemplate struct {
 
 func main() {
 	slog.SetLogLoggerLevel(slog.LevelDebug)
-	slog.Info("starting kv client")
 
 	reqTemplates, err := readRequests()
 	if err != nil {
@@ -27,8 +26,25 @@ func main() {
 		return
 	}
 
-	// TODO: replace with custom config
-	client := http.DefaultClient
+	transport := &http.Transport{
+		MaxConnsPerHost:       100,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       30 * time.Second,
+		ForceAttemptHTTP2:     false,
+		DisableCompression:    true,
+		ResponseHeaderTimeout: 15 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 0,
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second}).DialContext,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   20 * time.Second,
+	}
+	baseUrl := "http://localhost:8080/"
 	for _, reqTemplate := range reqTemplates {
 		switch reqTemplate.method {
 		case "GET":
