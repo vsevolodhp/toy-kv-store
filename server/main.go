@@ -11,7 +11,7 @@ import (
 )
 
 type server struct {
-	mux sync.RWMutex
+	mu sync.RWMutex
 	kv  map[string]string
 }
 
@@ -42,8 +42,8 @@ func (s *server) handleGet() func(http.ResponseWriter, *http.Request) {
 			return
 		}
 
-		s.mux.RLock()
-		defer s.mux.RUnlock()
+		s.mu.RLock()
+		defer s.mu.RUnlock()
 
 		v, ok := s.kv[key]
 		if !ok {
@@ -70,8 +70,8 @@ func (s *server) handlePut() func(http.ResponseWriter, *http.Request) {
 			return
 		}
 
-		s.mux.Lock()
-		defer s.mux.Unlock()
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
 		v := string(b)
 		if _, ok := s.kv[key]; ok {
@@ -92,8 +92,8 @@ func (s *server) handleDelete() func(http.ResponseWriter, *http.Request) {
 			return
 		}
 
-		s.mux.Lock()
-		defer s.mux.Unlock()
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
 		if _, ok := s.kv[key]; !ok {
 			http.Error(w, "key not found", http.StatusNotFound)
