@@ -24,9 +24,9 @@ func main() {
 
 	baseUrl := "http://localhost:8080"
 	transport := &http.Transport{
-		MaxConnsPerHost:       100,
-		MaxIdleConns:          200,
-		MaxIdleConnsPerHost:   100,
+		MaxConnsPerHost:       10,
+		MaxIdleConns:          20,
+		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       30 * time.Second,
 		ForceAttemptHTTP2:     false,
 		DisableCompression:    true,
@@ -158,21 +158,22 @@ func doGet(client *http.Client, baseUrl string, l line) {
 		return
 	}
 	resp, err := client.Do(req)
+	if err != nil {
+		slog.Error("request failed", slog.Any("error", err))
+		return
+	}
+	defer resp.Body.Close()
 	if l.expectNotFound {
 		if resp.StatusCode != http.StatusNotFound {
 			slog.Error("expected NOT_FOUND", slog.String("got", resp.Status), slog.Any("line", l))
 		}
 		return
 	}
-
 	if resp.StatusCode != http.StatusOK {
 		slog.Error("expected OK", slog.String("got", resp.Status), slog.Any("line", l))
 		return
 	}
-
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
 	got := string(body)
 	if got != l.expected {
 		slog.Error("unexpected response", slog.String("expected", l.expected), slog.String("got", got), slog.Any("line", l))
@@ -191,12 +192,12 @@ func doPut(client *http.Client, baseUrl string, l line) {
 		slog.Error("PUT failed", slog.Any("error", err), slog.Any("line", l))
 		return
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		slog.Error("PUT is unsuccesful", slog.Any("error", err), slog.Any("line", l))
 		return
 	}
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
 	got := string(body)
 	if got != l.payload {
 		slog.Error("unexpected response", slog.String("expected", l.payload), slog.String("got", got), slog.Any("line", l))
@@ -214,8 +215,8 @@ func doDelete(client *http.Client, baseUrl string, l line) {
 		slog.Error("DELETE failed", slog.Any("error", err), slog.Any("line", l))
 		return
 	}
+	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		slog.Error("delete is unsuccesful", slog.String("status", resp.Status), slog.Any("line", l))
