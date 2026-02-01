@@ -6,16 +6,19 @@ import (
 	"time"
 )
 
-type LogMiddleware struct {
+type Middleware struct {
 	handler http.Handler
 }
 
-func (l *LogMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (l *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s := time.Now()
 	l.handler.ServeHTTP(w, r)
-	slog.Info("processed", slog.Duration("elapsedTime", time.Since(s)))
+	slog.Info("processed",
+		slog.String("method", r.Method),
+		slog.String("path", r.URL.Path),
+		slog.Duration("elapsedTime", time.Since(s)))
 }
 
-func NewLogger(h http.Handler) *LogMiddleware {
-	return &LogMiddleware{h}
+func NewMiddleware(h http.Handler) *Middleware {
+	return &Middleware{h}
 }

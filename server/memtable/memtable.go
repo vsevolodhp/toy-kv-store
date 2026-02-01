@@ -1,23 +1,57 @@
 package memtable
 
 import (
+	"bufio"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 )
 
-var ErrKeyNotFound = errors.New("key not found")
-var ErrEmptyKey = errors.New("empty key")
+var (
+	ErrKeyNotFound = errors.New("key not found")
+	ErrEmptyKey    = errors.New("empty key")
+)
 
-type Memtable struct {
-	mu   sync.RWMutex
-	data map[string]string
+const MaxSize = 2_000
+
+type Entry struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
-func New() *Memtable {
-	return &Memtable{
-		data: make(map[string]string),
+type Memtable struct {
+	mu        sync.RWMutex
+	data      map[string]string
+	size      int
+	lastSSTID int
+}
+
+func New() (*Memtable, error) {
+	f, err := os.OpenFile("MANIFEST", os.O_CREATE|os.O_RDONLY, 0666)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read MANIFEST: %w", err)
 	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	var lastID int
+	for scanner.Scan() {
+		line := scanner.Text()
+		strs := strings.Split(line, "-")
+		id, err := strconv.Atoi(strings.TrimSuffix(strs[1], ".json"))
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse sst id: %w", err)
+		}
+		lastID = id
+	}
+	return &Memtable{
+		data:      make(map[string]string, MaxSize),
+		lastSSTID: lastID,
+	}, nil
 }
 
 func (mt *Memtable) Put(key, value string) error {
@@ -30,8 +64,38 @@ func (mt *Memtable) Put(key, value string) error {
 
 	if _, ok := mt.data[key]; ok {
 		slog.Debug("updating value", slog.String("key", key))
+	} else {
+		mt.size++
 	}
 	mt.data[key] = value
+
+	if mt.size == MaxSize {
+		temp := make([]Entry, 0, MaxSize)
+		for k, v := range mt.data {
+			temp = append(temp, Entry{k, v})
+		}
+		flush, err := json.Marshal(temp)
+		if err != nil {
+			return fmt.Errorf("unable to marshal: %w", err)
+		}
+		sstName := fmt.Sprintf("sst-%d.json", mt.lastSSTID+1)
+		err = os.WriteFile(sstName, flush, 0666)
+		if err != nil {
+			return fmt.Errorf("unable to flush: %w", err)
+		}
+		manifest, err := os.OpenFile("MANIFEST", os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("unable to open MANIFEST: %w", err)
+		}
+		_, err = manifest.WriteString(sstName + "\n")
+		manifest.Close()
+		if err != nil {
+			return fmt.Errorf("unable to write to MANIFEST: %w", err)
+		}
+		mt.lastSSTID++
+		mt.size = 0
+		clear(mt.data)
+	}
 
 	return nil
 }
@@ -61,6 +125,5 @@ func (mt *Memtable) Delete(key string) error {
 	defer mt.mu.Unlock()
 
 	delete(mt.data, key)
-
 	return nil
 }
