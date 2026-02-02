@@ -12,27 +12,28 @@ import (
 
 
 func main() {
-	slog.Info("starting toy-kv server")
 	mt, err := memtable.New()
 	if err != nil {
-		slog.Error("unable to create memtable", slog.Any("error", err))
-		return
+		panic("unable to create memtable")
 	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{key}", handleGet(mt))
 	mux.HandleFunc("PUT /{key}", handlePut(mt))
 	mux.HandleFunc("DELETE /{key}", handleDelete(mt))
 
-	wrapped := logging.NewMiddleware(mux)
-	err = http.ListenAndServe(":8080", wrapped)
+	handler := logging.WithRequestLogger(mux)
+
+	err = http.ListenAndServe(":8080", handler)
 	if err != nil {
-		slog.Error("unable to run server", slog.Any("error", err))
+		panic("unable to run server")
 	}
 }
 
 func handleGet(mt *memtable.Memtable) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.PathValue("key")
+
 		v, err := mt.Get(key)
 		if errors.Is(err, memtable.ErrEmptyKey) {
 			http.Error(w, "key cannot be empty", http.StatusBadRequest)
@@ -42,6 +43,7 @@ func handleGet(mt *memtable.Memtable) http.HandlerFunc {
 			http.Error(w, "key not found", http.StatusNotFound)
 			return
 		}
+
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte(v))
 	}
@@ -54,18 +56,20 @@ func handlePut(mt *memtable.Memtable) http.HandlerFunc {
 			http.Error(w, "key cannot be empty", http.StatusBadRequest)
 			return
 		}
+
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "unable to read body", http.StatusBadRequest)
 			return
 		}
-		v := string(b)
-		err = mt.Put(key, v)
+
+		err = mt.Put(key, string(b))
 		if err != nil {
-			slog.Error("unable to put value", slog.String("key", key))
+			slog.Error("unable to put value", slog.String("key", key), slog.Any("error", err))
 			http.Error(w, "unable to save value", http.StatusInternalServerError)
 			return
 		}
+
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write(b)
 	}
@@ -74,10 +78,15 @@ func handlePut(mt *memtable.Memtable) http.HandlerFunc {
 func handleDelete(mt *memtable.Memtable) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.PathValue("key")
+
 		err := mt.Delete(key)
-		if errors.Is(err, memtable.ErrEmptyKey) {
-			http.Error(w, "key cannot be empty", http.StatusBadRequest)
-			return
+		if err != nil {
+			if errors.Is(err, memtable.ErrEmptyKey) {
+				http.Error(w, "key cannot be empty", http.StatusBadRequest)
+				return
+			}
+			slog.Error("unable to delete", slog.String("key", key), slog.Any("error", err))
+			http.Error(w, "unable to delete", http.StatusInternalServerError)
 		}
 	}
 }
