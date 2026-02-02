@@ -10,7 +10,6 @@ import (
 	"github.com/vsevolodhp/toy-kv-store/server/memtable"
 )
 
-
 func main() {
 	mt, err := memtable.New()
 	if err != nil {

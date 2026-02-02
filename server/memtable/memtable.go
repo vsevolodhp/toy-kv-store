@@ -13,6 +13,9 @@ import (
 	"sync"
 )
 
+// TODO:
+// - Implement LRU Negative Cache (no disk scans for repeatedly non-existent keys)
+
 var (
 	ErrKeyNotFound = errors.New("key not found")
 	ErrEmptyKey    = errors.New("empty key")
@@ -85,7 +88,7 @@ func (mt *Memtable) Put(key, value string) error {
 			return fmt.Errorf("unable to marshal: %w", err)
 		}
 
-		sstName := fmt.Sprintf("sst-%d.json", mt.lastSSTID+1)
+		sstName := getSSTName(mt.lastSSTID + 1)
 		err = os.WriteFile(sstName, flush, 0666)
 		if err != nil {
 			return fmt.Errorf("unable to flush: %w", err)
@@ -119,11 +122,33 @@ func (mt *Memtable) Get(key string) (string, error) {
 	defer mt.mu.RUnlock()
 
 	v, ok := mt.data[key]
-	if !ok {
-		slog.Debug("key does not exist", slog.String("key", key))
-		return "", ErrKeyNotFound
+	if ok {
+		return v, nil
 	}
-	return v, nil
+
+	for i := mt.lastSSTID; i >= 1; i-- {
+		sstName := getSSTName(i)
+
+		b, err := os.ReadFile(sstName)
+		if err != nil {
+			return "", fmt.Errorf("cannot read SST table: %w", err)
+		}
+
+		entries := make([]Entry, 0, MaxSize)
+
+		err = json.Unmarshal(b, &entries)
+		if err != nil {
+			return "", fmt.Errorf("cannot unmarshal sst table content: %w", err)
+		}
+
+		for _, e := range entries {
+			if e.Key == key {
+				return e.Value, nil
+			}
+		}
+	}
+
+	return "", ErrKeyNotFound
 }
 
 func (mt *Memtable) Delete(key string) error {
@@ -136,4 +161,8 @@ func (mt *Memtable) Delete(key string) error {
 
 	delete(mt.data, key)
 	return nil
+}
+
+func getSSTName(id int) string {
+	return fmt.Sprintf("sst-%d.json", id)
 }
