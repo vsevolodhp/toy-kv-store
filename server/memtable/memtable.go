@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -70,28 +71,37 @@ func (mt *Memtable) Put(key, value string) error {
 	mt.data[key] = value
 
 	if mt.size == MaxSize {
-		temp := make([]Entry, 0, MaxSize)
+		entries := make([]Entry, 0, MaxSize)
+
 		for k, v := range mt.data {
-			temp = append(temp, Entry{k, v})
+			entries = append(entries, Entry{k, v})
 		}
-		flush, err := json.Marshal(temp)
+		slices.SortFunc(entries, func(a, b Entry) int {
+			return strings.Compare(a.Key, b.Key)
+		})
+
+		flush, err := json.Marshal(entries)
 		if err != nil {
 			return fmt.Errorf("unable to marshal: %w", err)
 		}
+
 		sstName := fmt.Sprintf("sst-%d.json", mt.lastSSTID+1)
 		err = os.WriteFile(sstName, flush, 0666)
 		if err != nil {
 			return fmt.Errorf("unable to flush: %w", err)
 		}
+
 		manifest, err := os.OpenFile("MANIFEST", os.O_APPEND|os.O_WRONLY, 0644)
 		if err != nil {
 			return fmt.Errorf("unable to open MANIFEST: %w", err)
 		}
+
 		_, err = manifest.WriteString(sstName + "\n")
 		manifest.Close()
 		if err != nil {
 			return fmt.Errorf("unable to write to MANIFEST: %w", err)
 		}
+
 		mt.lastSSTID++
 		mt.size = 0
 		clear(mt.data)
