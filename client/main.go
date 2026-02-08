@@ -54,21 +54,21 @@ func main() {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				doGet(client, baseUrl, l)
+				doGET(client, baseUrl, l)
 			}(l)
 		case "PUT":
 			go func(l line) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				doPut(client, baseUrl, l)
+				doPUT(client, baseUrl, l)
 			}(l)
 		case "DELETE":
 			go func(l line) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				doDelete(client, baseUrl, l)
+				doDELETE(client, baseUrl, l)
 			}(l)
 		default:
 			<-sem
@@ -151,13 +151,13 @@ func parseLine(raw string) (line, error) {
 	}
 }
 
-func doGet(client *http.Client, baseUrl string, l line) {
+func doGET(client *http.Client, baseUrl string, l line) {
 	req, err := http.NewRequest("GET", baseUrl+l.path, nil)
 	if err != nil {
 		slog.Error("unable to build GET request", slog.Any("error", err), slog.Any("line", l))
 		return
 	}
-	resp, err := client.Do(req)
+	resp, err := doWithRetry(client, req)
 	if err != nil {
 		slog.Error("request failed", slog.Any("error", err))
 		return
@@ -180,14 +180,14 @@ func doGet(client *http.Client, baseUrl string, l line) {
 	}
 }
 
-func doPut(client *http.Client, baseUrl string, l line) {
+func doPUT(client *http.Client, baseUrl string, l line) {
 	req, err := http.NewRequest("PUT", baseUrl+l.path, strings.NewReader(l.payload))
 	if err != nil {
 		slog.Error("unable to build PUT request", slog.Any("error", err), slog.Any("line", l))
 		return
 	}
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
-	resp, err := client.Do(req)
+	resp, err := doWithRetry(client, req)
 	if err != nil {
 		slog.Error("PUT failed", slog.Any("error", err), slog.Any("line", l))
 		return
@@ -204,13 +204,13 @@ func doPut(client *http.Client, baseUrl string, l line) {
 	}
 }
 
-func doDelete(client *http.Client, baseUrl string, l line) {
+func doDELETE(client *http.Client, baseUrl string, l line) {
 	req, err := http.NewRequest("DELETE", baseUrl+l.path, nil)
 	if err != nil {
 		slog.Error("unable to build DELETE request", slog.Any("error", err), slog.Any("line", l))
 		return
 	}
-	resp, err := client.Do(req)
+	resp, err := doWithRetry(client, req)
 	if err != nil {
 		slog.Error("DELETE failed", slog.Any("error", err), slog.Any("line", l))
 		return
@@ -221,4 +221,28 @@ func doDelete(client *http.Client, baseUrl string, l line) {
 	if resp.StatusCode != http.StatusOK {
 		slog.Error("delete is unsuccesful", slog.String("status", resp.Status), slog.Any("line", l))
 	}
+}
+
+func doWithRetry(client *http.Client, req *http.Request) (*http.Response, error) {
+	backoffs := []time.Duration{10 * time.Millisecond, 30 * time.Millisecond, 100 * time.Millisecond, 300 * time.Millisecond, 5 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt < len(backoffs)+1; attempt++ {
+		resp, err := client.Do(req.Clone(req.Context()))
+		if err == nil && (resp.StatusCode < 500 || resp.StatusCode >= 600) {
+			return resp, nil
+		}
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("server returned: %s", resp.Status)
+		} else {
+			lastErr = err
+		}
+		if attempt == len(backoffs) {
+			break
+		}
+		time.Sleep(backoffs[attempt])
+	}
+
+	return nil, lastErr
 }
