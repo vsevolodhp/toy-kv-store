@@ -1,2 +1,3 @@
 server/MANIFEST
 server/sst*.json
+server/wal.db
