@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/vsevolodhp/toy-kv-store/server/logging"
+	"github.com/vsevolodhp/toy-kv-store/server/logger"
 	"github.com/vsevolodhp/toy-kv-store/server/memtable"
 )
 
@@ -21,7 +21,7 @@ func main() {
 	mux.HandleFunc("PUT /{key}", handlePut(mt))
 	mux.HandleFunc("DELETE /{key}", handleDelete(mt))
 
-	handler := logging.WithRequestLogger(mux)
+	handler := logger.WithRequestLogger(mux)
 
 	err = http.ListenAndServe(":8080", handler)
 	if err != nil {

@@ -16,7 +16,7 @@ import (
 func main() {
 	slog.SetLogLoggerLevel(slog.LevelDebug)
 
-	lines, err := readLines()
+	lines, err := readLines("puts.txt")
 	if err != nil {
 		slog.Error("unable to read requests", slog.Any("error", err))
 		return
@@ -92,8 +92,8 @@ type line struct {
 	raw            string
 }
 
-func readLines() ([]line, error) {
-	f, err := os.Open("puts.txt")
+func readLines(filename string) ([]line, error) {
+	f, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
@@ -105,9 +105,12 @@ func readLines() ([]line, error) {
 	for sc.Scan() {
 		lineno++
 		str := strings.TrimSpace(sc.Text())
+
+		// ignore line breaks and commented lines
 		if str == "" || strings.HasPrefix(str, "#") {
 			continue
 		}
+
 		l, err := parseLine(str)
 		l.lineno = lineno
 		if err != nil {
