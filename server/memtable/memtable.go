@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
+	"io"
 	"os"
 	"slices"
 	"strconv"
@@ -31,7 +31,6 @@ type Entry struct {
 type Memtable struct {
 	mu        sync.RWMutex
 	data      map[string]string
-	size      int
 	lastSSTID int
 }
 
@@ -52,10 +51,18 @@ func New() (*Memtable, error) {
 		}
 		lastID = id
 	}
-	return &Memtable{
+
+	memtable := &Memtable{
 		data:      make(map[string]string, MaxSize),
 		lastSSTID: lastID,
-	}, nil
+	}
+
+	err = memtable.replayWAL()
+	if err != nil {
+		return nil, err
+	}
+
+	return memtable, nil
 }
 
 func (mt *Memtable) Put(key, value string) error {
@@ -66,14 +73,14 @@ func (mt *Memtable) Put(key, value string) error {
 	mt.mu.Lock()
 	defer mt.mu.Unlock()
 
-	if _, ok := mt.data[key]; ok {
-		slog.Debug("updating value", slog.String("key", key))
-	} else {
-		mt.size++
+	err := writeToWAL("put", key, value)
+	if err != nil {
+		return err
 	}
+
 	mt.data[key] = value
 
-	if mt.size == MaxSize {
+	if len(mt.data) == MaxSize {
 		entries := make([]Entry, 0, MaxSize)
 
 		for k, v := range mt.data {
@@ -106,8 +113,11 @@ func (mt *Memtable) Put(key, value string) error {
 		}
 
 		mt.lastSSTID++
-		mt.size = 0
 		clear(mt.data)
+		err = truncateWAL()
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -135,7 +145,6 @@ func (mt *Memtable) Get(key string) (string, error) {
 		}
 
 		entries := make([]Entry, 0, MaxSize)
-
 		err = json.Unmarshal(b, &entries)
 		if err != nil {
 			return "", fmt.Errorf("cannot unmarshal sst table content: %w", err)
@@ -156,11 +165,79 @@ func (mt *Memtable) Delete(key string) error {
 		return ErrEmptyKey
 	}
 
+	err := writeToWAL("delete", key, "")
+	if err != nil {
+		return err
+	}
+
 	mt.mu.Lock()
 	defer mt.mu.Unlock()
 
 	delete(mt.data, key)
 	return nil
+}
+
+type walEntry struct {
+	Op    string `json:"op"`
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+func (mt *Memtable) replayWAL() error {
+	f, err := os.OpenFile("wal.db", os.O_CREATE|os.O_RDONLY, 0666)
+	if err != nil {
+		return fmt.Errorf("unable to open WAL: %w", err)
+	}
+	defer f.Close()
+	dec := json.NewDecoder(f)
+	for {
+		var entry walEntry
+		err = dec.Decode(&entry)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("unable to process WAL: %w", err)
+		}
+
+		switch entry.Op {
+		case "put":
+			mt.data[entry.Key] = entry.Value
+		case "delete":
+			delete(mt.data, entry.Key)
+		default:
+			return fmt.Errorf("unknown op: %s", entry.Op)
+		}
+	}
+	return nil
+}
+
+func writeToWAL(op, key, value string) error {
+	f, err := os.OpenFile("wal.db", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("unable to open WAL: %w", err)
+	}
+	defer f.Close()
+	e := walEntry{
+		Op:    op,
+		Key:   key,
+		Value: value,
+	}
+	b, err := json.Marshal(e)
+	if err != nil {
+		return fmt.Errorf("unable to marshal: %w", err)
+	}
+	_, err = f.WriteString(string(b) + "\n")
+	if err != nil {
+		return fmt.Errorf("unable to write to WAL: %w", err)
+	}
+	_ = f.Sync()
+
+	return nil
+}
+
+func truncateWAL() error {
+	return os.Truncate("wal.db", 0)
 }
 
 func getSSTName(id int) string {
