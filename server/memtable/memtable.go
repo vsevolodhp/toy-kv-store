@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 )
@@ -21,7 +20,10 @@ var (
 	ErrEmptyKey    = errors.New("empty key")
 )
 
-const MaxSize = 2_000
+const (
+	MaxSize    = 2_000
+	SSTNameFmt = "sst-%d.json"
+)
 
 type Entry struct {
 	Key   string `json:"key"`
@@ -35,21 +37,19 @@ type Memtable struct {
 }
 
 func New() (*Memtable, error) {
-	f, err := os.OpenFile("MANIFEST", os.O_CREATE|os.O_RDONLY, 0666)
+	f, err := os.OpenFile("MANIFEST", os.O_CREATE|os.O_RDONLY, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read MANIFEST: %w", err)
 	}
 	defer f.Close()
+
 	scanner := bufio.NewScanner(f)
 	var lastID int
 	for scanner.Scan() {
 		line := scanner.Text()
-		strs := strings.Split(line, "-")
-		id, err := strconv.Atoi(strings.TrimSuffix(strs[1], ".json"))
-		if err != nil {
+		if _, err = fmt.Sscanf(line, SSTNameFmt, &lastID); err != nil {
 			return nil, fmt.Errorf("cannot parse sst id: %w", err)
 		}
-		lastID = id
 	}
 
 	memtable := &Memtable{
@@ -81,40 +81,7 @@ func (mt *Memtable) Put(key, value string) error {
 	mt.data[key] = value
 
 	if len(mt.data) == MaxSize {
-		entries := make([]Entry, 0, MaxSize)
-
-		for k, v := range mt.data {
-			entries = append(entries, Entry{k, v})
-		}
-		slices.SortFunc(entries, func(a, b Entry) int {
-			return strings.Compare(a.Key, b.Key)
-		})
-
-		flush, err := json.Marshal(entries)
-		if err != nil {
-			return fmt.Errorf("unable to marshal: %w", err)
-		}
-
-		sstName := getSSTName(mt.lastSSTID + 1)
-		err = os.WriteFile(sstName, flush, 0666)
-		if err != nil {
-			return fmt.Errorf("unable to flush: %w", err)
-		}
-
-		manifest, err := os.OpenFile("MANIFEST", os.O_APPEND|os.O_WRONLY, 0644)
-		if err != nil {
-			return fmt.Errorf("unable to open MANIFEST: %w", err)
-		}
-
-		_, err = manifest.WriteString(sstName + "\n")
-		manifest.Close()
-		if err != nil {
-			return fmt.Errorf("unable to write to MANIFEST: %w", err)
-		}
-
-		mt.lastSSTID++
-		clear(mt.data)
-		err = truncateWAL()
+		err = mt.flush()
 		if err != nil {
 			return err
 		}
@@ -236,10 +203,49 @@ func writeToWAL(op, key, value string) error {
 	return nil
 }
 
-func truncateWAL() error {
-	return os.Truncate("wal.db", 0)
+func (mt *Memtable) flush() error {
+	entries := make([]Entry, 0, MaxSize)
+
+	for k, v := range mt.data {
+		entries = append(entries, Entry{k, v})
+	}
+	slices.SortFunc(entries, func(a, b Entry) int {
+		return strings.Compare(a.Key, b.Key)
+	})
+
+	sst, err := json.Marshal(entries)
+	if err != nil {
+		return fmt.Errorf("unable to marshal: %w", err)
+	}
+
+	sstName := getSSTName(mt.lastSSTID + 1)
+	err = os.WriteFile(sstName, sst, 0644)
+	if err != nil {
+		return fmt.Errorf("unable to flush: %w", err)
+	}
+
+	manifest, err := os.OpenFile("MANIFEST", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("unable to open MANIFEST: %w", err)
+	}
+	defer manifest.Close()
+
+	_, err = manifest.WriteString(sstName + "\n")
+	if err != nil {
+		return fmt.Errorf("unable to write to MANIFEST: %w", err)
+	}
+
+	mt.lastSSTID++
+	clear(mt.data)
+
+	err = os.Truncate("wal.db", 0)
+	if err != nil {
+		return fmt.Errorf("unable to truncate WAL: %w", err)
+	}
+
+	return nil
 }
 
 func getSSTName(id int) string {
-	return fmt.Sprintf("sst-%d.json", id)
+	return fmt.Sprintf(SSTNameFmt, id)
 }
