@@ -37,32 +37,21 @@ type Memtable struct {
 }
 
 func New() (*Memtable, error) {
-	f, err := os.OpenFile("MANIFEST", os.O_CREATE|os.O_RDONLY, 0644)
+	lastSSTID, err := getLastSSTID()
 	if err != nil {
-		return nil, fmt.Errorf("unable to read MANIFEST: %w", err)
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	var lastID int
-	for scanner.Scan() {
-		line := scanner.Text()
-		if _, err = fmt.Sscanf(line, SSTNameFmt, &lastID); err != nil {
-			return nil, fmt.Errorf("cannot parse sst id: %w", err)
-		}
+		return nil, fmt.Errorf("unable to get SST ID: %w", err)
 	}
 
-	memtable := &Memtable{
+	mt := &Memtable{
 		data:      make(map[string]string, MaxSize),
-		lastSSTID: lastID,
+		lastSSTID: lastSSTID,
 	}
 
-	err = memtable.replayWAL()
+	err = mt.replayWAL()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to replay WAL: %w", err)
 	}
-
-	return memtable, nil
+	return mt, nil
 }
 
 func (mt *Memtable) Put(key, value string) error {
@@ -103,6 +92,7 @@ func (mt *Memtable) Get(key string) (string, error) {
 		return v, nil
 	}
 
+	// TODO: the lastSSTID in memtable and MANIFEST can become inconsistent
 	for i := mt.lastSSTID; i >= 1; i-- {
 		sstName := getSSTName(i)
 
@@ -111,6 +101,8 @@ func (mt *Memtable) Get(key string) (string, error) {
 			return "", fmt.Errorf("cannot read SST table: %w", err)
 		}
 
+		// the file contains 2000 entries and has size ~59kb (for test inputs)
+		// for now won't use Decoder for simplicity reasons
 		entries := make([]Entry, 0, MaxSize)
 		err = json.Unmarshal(b, &entries)
 		if err != nil {
@@ -140,6 +132,7 @@ func (mt *Memtable) Delete(key string) error {
 	mt.mu.Lock()
 	defer mt.mu.Unlock()
 
+	// TODO: delete from sst tables as well
 	delete(mt.data, key)
 	return nil
 }
@@ -205,7 +198,6 @@ func writeToWAL(op, key, value string) error {
 
 func (mt *Memtable) flush() error {
 	entries := make([]Entry, 0, MaxSize)
-
 	for k, v := range mt.data {
 		entries = append(entries, Entry{k, v})
 	}
@@ -248,4 +240,23 @@ func (mt *Memtable) flush() error {
 
 func getSSTName(id int) string {
 	return fmt.Sprintf(SSTNameFmt, id)
+}
+
+// Reads MANIFEST and returns last SST ID
+func getLastSSTID() (int, error) {
+	f, err := os.OpenFile("MANIFEST", os.O_CREATE|os.O_RDONLY, 0644)
+	if err != nil {
+		return 0, fmt.Errorf("unable to read MANIFEST: %w", err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	var lastID int
+	for scanner.Scan() {
+		line := scanner.Text()
+		if _, err = fmt.Sscanf(line, SSTNameFmt, &lastID); err != nil {
+			return 0, fmt.Errorf("cannot parse sst id: %w", err)
+		}
+	}
+	return lastID, nil
 }
