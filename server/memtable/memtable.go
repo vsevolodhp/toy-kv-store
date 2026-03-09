@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"log/slog"
 	"os"
 	"slices"
 	"strings"
 	"sync"
+
+	"github.com/vsevolodhp/toy-kv-store/server/wal"
 )
 
 // TODO:
@@ -33,25 +35,48 @@ type Entry struct {
 type Memtable struct {
 	mu        sync.RWMutex
 	data      map[string]string
+	wal       *wal.WAL
 	lastSSTID int
 }
 
-func New() (*Memtable, error) {
+func New(w *wal.WAL) (*Memtable, error) {
 	lastSSTID, err := getLastSSTID()
 	if err != nil {
 		return nil, fmt.Errorf("unable to get SST ID: %w", err)
 	}
 
-	mt := &Memtable{
-		data:      make(map[string]string, MaxSize),
-		lastSSTID: lastSSTID,
-	}
+	d := make(map[string]string, MaxSize)
 
-	err = mt.replayWAL()
+	err = w.ReplayLog(func(logOp wal.LogOp) {
+		switch logOp.Op {
+		case "put":
+			d[logOp.Key] = logOp.Value
+		case "delete":
+			delete(d, logOp.Key)
+		default:
+			slog.Error("unspported log operation", slog.String("operation", logOp.Op))
+		}
+	})
+
 	if err != nil {
 		return nil, fmt.Errorf("unable to replay WAL: %w", err)
 	}
+
+	mt := &Memtable{
+		data:      d,
+		wal:       w,
+		lastSSTID: lastSSTID,
+	}
+
+	if len(d) == MaxSize {
+		err = mt.flush()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return mt, nil
+
 }
 
 func (mt *Memtable) Put(key, value string) error {
@@ -62,7 +87,7 @@ func (mt *Memtable) Put(key, value string) error {
 	mt.mu.Lock()
 	defer mt.mu.Unlock()
 
-	err := writeToWAL("put", key, value)
+	err := mt.wal.Log(wal.LogOp{Op: "put", Key: key, Value: value})
 	if err != nil {
 		return err
 	}
@@ -124,7 +149,7 @@ func (mt *Memtable) Delete(key string) error {
 		return ErrEmptyKey
 	}
 
-	err := writeToWAL("delete", key, "")
+	err := mt.wal.Log(wal.LogOp{Op: "delete", Key: key, Value: ""})
 	if err != nil {
 		return err
 	}
@@ -134,65 +159,6 @@ func (mt *Memtable) Delete(key string) error {
 
 	// TODO: delete from sst tables as well
 	delete(mt.data, key)
-	return nil
-}
-
-type walEntry struct {
-	Op    string `json:"op"`
-	Key   string `json:"key"`
-	Value string `json:"value"`
-}
-
-func (mt *Memtable) replayWAL() error {
-	f, err := os.OpenFile("wal.db", os.O_CREATE|os.O_RDONLY, 0666)
-	if err != nil {
-		return fmt.Errorf("unable to open WAL: %w", err)
-	}
-	defer f.Close()
-	dec := json.NewDecoder(f)
-	for {
-		var entry walEntry
-		err = dec.Decode(&entry)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return fmt.Errorf("unable to process WAL: %w", err)
-		}
-
-		switch entry.Op {
-		case "put":
-			mt.data[entry.Key] = entry.Value
-		case "delete":
-			delete(mt.data, entry.Key)
-		default:
-			return fmt.Errorf("unknown op: %s", entry.Op)
-		}
-	}
-	return nil
-}
-
-func writeToWAL(op, key, value string) error {
-	f, err := os.OpenFile("wal.db", os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("unable to open WAL: %w", err)
-	}
-	defer f.Close()
-	e := walEntry{
-		Op:    op,
-		Key:   key,
-		Value: value,
-	}
-	b, err := json.Marshal(e)
-	if err != nil {
-		return fmt.Errorf("unable to marshal: %w", err)
-	}
-	_, err = f.WriteString(string(b) + "\n")
-	if err != nil {
-		return fmt.Errorf("unable to write to WAL: %w", err)
-	}
-	_ = f.Sync()
-
 	return nil
 }
 
@@ -211,28 +177,64 @@ func (mt *Memtable) flush() error {
 	}
 
 	sstName := getSSTName(mt.lastSSTID + 1)
-	err = os.WriteFile(sstName, sst, 0644)
+	// use current dir for both MANIFEST and SST
+	dir, err := os.Open(".")
 	if err != nil {
+		return fmt.Errorf("unable to open parent dir: %w", err)
+	}
+	defer dir.Close()
+
+	if err = os.WriteFile(sstName, sst, 0644); err != nil {
 		return fmt.Errorf("unable to flush: %w", err)
 	}
 
-	manifest, err := os.OpenFile("MANIFEST", os.O_APPEND|os.O_WRONLY, 0644)
+	if err = dir.Sync(); err != nil {
+		return fmt.Errorf("unable to sync parent dir: %w", err)
+	}
+
+	manifest, err := os.ReadFile("MANIFEST")
 	if err != nil {
 		return fmt.Errorf("unable to open MANIFEST: %w", err)
 	}
-	defer manifest.Close()
+	manifest = slices.Concat(manifest, []byte(sstName+"\n"))
 
-	_, err = manifest.WriteString(sstName + "\n")
+	tmpManifest, err := os.OpenFile("MANIFEST.tmp", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		return fmt.Errorf("unable to write to MANIFEST: %w", err)
+		return fmt.Errorf("unable to create temp MANIFEST file: %w", err)
+	}
+	defer func() {
+		if tmpManifest != nil {
+			// if error happened before and we didn't manually close
+			// we will still try to call Close and remove tmp file
+			tmpManifest.Close()
+			os.Remove("MANIFEST.tmp")
+		}
+	}()
+
+	if _, err = tmpManifest.Write(manifest); err != nil {
+		return fmt.Errorf("unable to write to temp MANIFEST: %w", err)
+	}
+	if err = tmpManifest.Sync(); err != nil {
+		return fmt.Errorf("unable to sync temp MANIFEST: %w", err)
+	}
+	if err = tmpManifest.Close(); err != nil {
+		return fmt.Errorf("unable to close MANIFEST.tmp: %w", err)
+	}
+	tmpManifest = nil
+
+	if err = os.Rename("MANIFEST.tmp", "MANIFEST"); err != nil {
+		return fmt.Errorf("unable to rename MANIFEST.tmp: %w", err)
+	}
+
+	if err = dir.Sync(); err != nil {
+		return fmt.Errorf("unable to sync parent dir: %w", err)
 	}
 
 	mt.lastSSTID++
 	clear(mt.data)
 
-	err = os.Truncate("wal.db", 0)
-	if err != nil {
-		return fmt.Errorf("unable to truncate WAL: %w", err)
+	if err = mt.wal.Truncate(); err != nil {
+		return err
 	}
 
 	return nil
@@ -250,6 +252,7 @@ func getLastSSTID() (int, error) {
 	}
 	defer f.Close()
 
+	// TODO: should I be doing at all?
 	scanner := bufio.NewScanner(f)
 	var lastID int
 	for scanner.Scan() {

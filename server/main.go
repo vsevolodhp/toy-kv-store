@@ -8,10 +8,17 @@ import (
 
 	"github.com/vsevolodhp/toy-kv-store/server/logger"
 	"github.com/vsevolodhp/toy-kv-store/server/memtable"
+	"github.com/vsevolodhp/toy-kv-store/server/wal"
 )
 
 func main() {
-	mt, err := memtable.New()
+	wal, err := wal.New("wal.db")
+	if err != nil {
+		panic("unable to init WAL")
+	}
+	defer wal.Close()
+
+	mt, err := memtable.New(wal)
 	if err != nil {
 		panic("unable to create memtable")
 	}
