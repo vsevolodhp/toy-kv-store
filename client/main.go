@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"log/slog"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -14,12 +14,9 @@ import (
 )
 
 func main() {
-	slog.SetLogLoggerLevel(slog.LevelDebug)
-
 	lines, err := readLines("puts.txt")
 	if err != nil {
-		slog.Error("unable to read requests", slog.Any("error", err))
-		return
+		log.Fatal("unable to read requests: %w", err)
 	}
 
 	baseUrl := "http://localhost:8080"
@@ -43,43 +40,51 @@ func main() {
 	}
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 1)
+	f, err := os.OpenFile("latency_sample.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatal("unable to create latency_sample: %w", err)
+	}
+	defer f.Close()
+	f.WriteString("Sample,Latency_Secs\n")
 
 	for _, l := range lines {
 		wg.Add(1)
 		sem <- struct{}{}
-		slog.Debug("processing request", slog.Int("lineno", l.lineno))
 		switch l.method {
 		case "GET":
 			go func(l line) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
+				start := time.Now()
 				doGET(client, baseUrl, l)
+				fmt.Fprintf(f, "%d,%.4f\n", l.lineno, time.Since(start).Seconds())
 			}(l)
 		case "PUT":
 			go func(l line) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
+				start := time.Now()
 				doPUT(client, baseUrl, l)
+				fmt.Fprintf(f, "%d,%.4f\n", l.lineno, time.Since(start).Seconds())
 			}(l)
 		case "DELETE":
 			go func(l line) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
+				start := time.Now()
 				doDELETE(client, baseUrl, l)
+				fmt.Fprintf(f, "%d,%.4f\n", l.lineno, time.Since(start).Seconds())
 			}(l)
 		default:
 			<-sem
 			wg.Done()
-
-			slog.Error("unsupported request method", slog.String("method", l.method))
 		}
 	}
 	wg.Wait()
-
-	slog.Info("all lines have been processed")
+	log.Print("all lines have been processed")
 }
 
 type line struct {
@@ -114,7 +119,7 @@ func readLines(filename string) ([]line, error) {
 		l, err := parseLine(str)
 		l.lineno = lineno
 		if err != nil {
-			slog.Error("unable to parse line", slog.Any("error", err), slog.Int("lineno", lineno))
+			log.Printf("unable to parse line #%d: %s", lineno, err)
 			continue
 		}
 		out = append(out, l)
@@ -157,72 +162,72 @@ func parseLine(raw string) (line, error) {
 func doGET(client *http.Client, baseUrl string, l line) {
 	req, err := http.NewRequest("GET", baseUrl+l.path, nil)
 	if err != nil {
-		slog.Error("unable to build GET request", slog.Any("error", err), slog.Any("line", l))
+		log.Printf("unable to build GET request #%d: %v", l.lineno, err)
 		return
 	}
 	resp, err := doWithRetry(client, req)
 	if err != nil {
-		slog.Error("request failed", slog.Any("error", err))
+		log.Printf("request #%d failed: %v", l.lineno, err)
 		return
 	}
 	defer resp.Body.Close()
 	if l.expectNotFound {
 		if resp.StatusCode != http.StatusNotFound {
-			slog.Error("expected NOT_FOUND", slog.String("got", resp.Status), slog.Any("line", l))
+			log.Printf("expected: NOT_FOUND, got: %q, line: %d", resp.Status, l.lineno)
 		}
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
-		slog.Error("expected OK", slog.String("got", resp.Status), slog.Any("line", l))
+		log.Printf("expected: OK, got: %q, line: %d", resp.Status, l.lineno)
 		return
 	}
 	body, _ := io.ReadAll(resp.Body)
 	got := string(body)
 	if got != l.expected {
-		slog.Error("unexpected response", slog.String("expected", l.expected), slog.String("got", got), slog.Any("line", l))
+		log.Printf("expected: %q, got: %q, line: %d", l.expected, got, l.lineno)
 	}
 }
 
 func doPUT(client *http.Client, baseUrl string, l line) {
 	req, err := http.NewRequest("PUT", baseUrl+l.path, strings.NewReader(l.payload))
 	if err != nil {
-		slog.Error("unable to build PUT request", slog.Any("error", err), slog.Any("line", l))
+		log.Printf("unable to build PUT request #%d: %v", l.lineno, err)
 		return
 	}
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
 	resp, err := doWithRetry(client, req)
 	if err != nil {
-		slog.Error("PUT failed", slog.Any("error", err), slog.Any("line", l))
+		log.Printf("request #%d failed: %v", l.lineno, err)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		slog.Error("PUT is unsuccesful", slog.Any("error", err), slog.Any("line", l))
+		log.Printf("expected: OK, got: %q, line: %d", resp.Status, l.lineno)
 		return
 	}
 	body, _ := io.ReadAll(resp.Body)
 	got := string(body)
 	if got != l.payload {
-		slog.Error("unexpected response", slog.String("expected", l.payload), slog.String("got", got), slog.Any("line", l))
+		log.Printf("expected: %q, got: %q, line: %d", l.expected, got, l.lineno)
 	}
 }
 
 func doDELETE(client *http.Client, baseUrl string, l line) {
 	req, err := http.NewRequest("DELETE", baseUrl+l.path, nil)
 	if err != nil {
-		slog.Error("unable to build DELETE request", slog.Any("error", err), slog.Any("line", l))
+		log.Printf("unable to build DELETE request #%d: %v", l.lineno, err)
 		return
 	}
 	resp, err := doWithRetry(client, req)
 	if err != nil {
-		slog.Error("DELETE failed", slog.Any("error", err), slog.Any("line", l))
+		log.Printf("request #%d failed: %v", l.lineno, err)
 		return
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		slog.Error("delete is unsuccesful", slog.String("status", resp.Status), slog.Any("line", l))
+		log.Printf("expected: OK, got: %q, line: %d", resp.Status, l.lineno)
 	}
 }
 
