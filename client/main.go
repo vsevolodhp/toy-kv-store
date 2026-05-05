@@ -45,22 +45,24 @@ func main() {
 		log.Fatal("unable to create latency_sample: %w", err)
 	}
 	defer f.Close()
+	// TODO: use encoding/csv
 	f.WriteString("Sample,Latency_Secs\n")
 
 	for _, l := range lines {
 		wg.Add(1)
 		sem <- struct{}{}
 		switch l.method {
-		case "GET":
+		case http.MethodGet:
 			go func(l line) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
+				// TODO: move to where request is actually happening
 				start := time.Now()
 				doGET(client, baseUrl, l)
 				fmt.Fprintf(f, "%d,%.4f\n", l.lineno, time.Since(start).Seconds())
 			}(l)
-		case "PUT":
+		case http.MethodPut:
 			go func(l line) {
 				defer wg.Done()
 				defer func() { <-sem }()
@@ -69,7 +71,7 @@ func main() {
 				doPUT(client, baseUrl, l)
 				fmt.Fprintf(f, "%d,%.4f\n", l.lineno, time.Since(start).Seconds())
 			}(l)
-		case "DELETE":
+		case http.MethodDelete:
 			go func(l line) {
 				defer wg.Done()
 				defer func() { <-sem }()
@@ -160,7 +162,7 @@ func parseLine(raw string) (line, error) {
 }
 
 func doGET(client *http.Client, baseUrl string, l line) {
-	req, err := http.NewRequest("GET", baseUrl+l.path, nil)
+	req, err := http.NewRequest(http.MethodGet, baseUrl+l.path, nil)
 	if err != nil {
 		log.Printf("unable to build GET request #%d: %v", l.lineno, err)
 		return
@@ -189,7 +191,7 @@ func doGET(client *http.Client, baseUrl string, l line) {
 }
 
 func doPUT(client *http.Client, baseUrl string, l line) {
-	req, err := http.NewRequest("PUT", baseUrl+l.path, strings.NewReader(l.payload))
+	req, err := http.NewRequest(http.MethodPut, baseUrl+l.path, strings.NewReader(l.payload))
 	if err != nil {
 		log.Printf("unable to build PUT request #%d: %v", l.lineno, err)
 		return
@@ -213,7 +215,7 @@ func doPUT(client *http.Client, baseUrl string, l line) {
 }
 
 func doDELETE(client *http.Client, baseUrl string, l line) {
-	req, err := http.NewRequest("DELETE", baseUrl+l.path, nil)
+	req, err := http.NewRequest(http.MethodDelete, baseUrl+l.path, nil)
 	if err != nil {
 		log.Printf("unable to build DELETE request #%d: %v", l.lineno, err)
 		return
@@ -232,7 +234,13 @@ func doDELETE(client *http.Client, baseUrl string, l line) {
 }
 
 func doWithRetry(client *http.Client, req *http.Request) (*http.Response, error) {
-	backoffs := []time.Duration{10 * time.Millisecond, 30 * time.Millisecond, 100 * time.Millisecond, 300 * time.Millisecond, 5 * time.Second}
+	backoffs := []time.Duration{
+		10 * time.Millisecond,
+		30 * time.Millisecond,
+		100 * time.Millisecond,
+		300 * time.Millisecond,
+		5 * time.Second,
+	}
 	var lastErr error
 	for attempt := 0; attempt < len(backoffs)+1; attempt++ {
 		resp, err := client.Do(req.Clone(req.Context()))
