@@ -34,6 +34,7 @@ func main() {
 	if err != nil {
 		panic("unable to run server")
 	}
+
 }
 
 func handleGet(mt *memtable.Memtable) http.HandlerFunc {
