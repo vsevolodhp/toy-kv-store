@@ -10,8 +10,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-
-	"github.com/vsevolodhp/toy-kv-store/server/wal"
 )
 
 // TODO:
@@ -35,11 +33,17 @@ type Entry struct {
 type Memtable struct {
 	mu        sync.RWMutex
 	data      map[string]string
-	wal       *wal.WAL
+	wal       *WAL
 	lastSSTID int
 }
 
-func New(w *wal.WAL) (*Memtable, error) {
+func New() (*Memtable, error) {
+	wal, err := initWal("wal.log")
+	if err != nil {
+		return nil, err
+	}
+	defer wal.Close()
+
 	lastSSTID, err := getLastSSTID()
 	if err != nil {
 		return nil, fmt.Errorf("unable to get SST ID: %w", err)
@@ -47,7 +51,7 @@ func New(w *wal.WAL) (*Memtable, error) {
 
 	d := make(map[string]string, MaxSize)
 
-	err = w.ReplayLog(func(logOp wal.LogOp) {
+	err = wal.ReplayLog(func(logOp logOp) {
 		switch logOp.Op {
 		case "put":
 			d[logOp.Key] = logOp.Value
@@ -64,7 +68,7 @@ func New(w *wal.WAL) (*Memtable, error) {
 
 	mt := &Memtable{
 		data:      d,
-		wal:       w,
+		wal:       wal,
 		lastSSTID: lastSSTID,
 	}
 
@@ -87,7 +91,7 @@ func (mt *Memtable) Put(key, value string) error {
 	mt.mu.Lock()
 	defer mt.mu.Unlock()
 
-	err := mt.wal.Log(wal.LogOp{Op: "put", Key: key, Value: value})
+	err := mt.wal.Log(logOp{Op: "put", Key: key, Value: value})
 	if err != nil {
 		return err
 	}
@@ -149,7 +153,7 @@ func (mt *Memtable) Delete(key string) error {
 		return ErrEmptyKey
 	}
 
-	err := mt.wal.Log(wal.LogOp{Op: "delete", Key: key, Value: ""})
+	err := mt.wal.Log(logOp{Op: "delete", Key: key, Value: ""})
 	if err != nil {
 		return err
 	}
@@ -225,7 +229,6 @@ func (mt *Memtable) flush() error {
 	if err = os.Rename("MANIFEST.tmp", "MANIFEST"); err != nil {
 		return fmt.Errorf("unable to rename MANIFEST.tmp: %w", err)
 	}
-
 	if err = dir.Sync(); err != nil {
 		return fmt.Errorf("unable to sync parent dir: %w", err)
 	}

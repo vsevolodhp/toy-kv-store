@@ -9,7 +9,6 @@ import (
 	"fmt"
 
 	"github.com/vsevolodhp/toy-kv-store/server/memtable"
-	"github.com/vsevolodhp/toy-kv-store/server/wal"
 )
 
 func main() {
@@ -24,13 +23,7 @@ func main() {
 
 func run(port int) error {
 	slog.Info("starting server", "port", port)
-	w, err := wal.New("wal.db")
-	if err != nil {
-		return err
-	}
-	defer w.Close()
-
-	mt, err := memtable.New(w)
+	mt, err := memtable.New()
 	if err != nil {
 		return err
 	}
