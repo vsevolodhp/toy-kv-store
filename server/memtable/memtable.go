@@ -42,7 +42,6 @@ func New() (*Memtable, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer wal.Close()
 
 	lastSSTID, err := getLastSSTID()
 	if err != nil {
@@ -51,7 +50,7 @@ func New() (*Memtable, error) {
 
 	d := make(map[string]string, MaxSize)
 
-	err = wal.ReplayLog(func(logOp logOp) {
+	err = wal.ReplayLog(func(logOp LogOp) {
 		switch logOp.Op {
 		case "put":
 			d[logOp.Key] = logOp.Value
@@ -91,7 +90,7 @@ func (mt *Memtable) Put(key, value string) error {
 	mt.mu.Lock()
 	defer mt.mu.Unlock()
 
-	err := mt.wal.Log(logOp{Op: "put", Key: key, Value: value})
+	err := mt.wal.Log(LogOp{Op: "put", Key: key, Value: value})
 	if err != nil {
 		return err
 	}
@@ -153,7 +152,7 @@ func (mt *Memtable) Delete(key string) error {
 		return ErrEmptyKey
 	}
 
-	err := mt.wal.Log(logOp{Op: "delete", Key: key, Value: ""})
+	err := mt.wal.Log(LogOp{Op: "delete", Key: key, Value: ""})
 	if err != nil {
 		return err
 	}
@@ -241,6 +240,10 @@ func (mt *Memtable) flush() error {
 	}
 
 	return nil
+}
+
+func (m *Memtable) Close() {
+	m.wal.Close()
 }
 
 func getSSTName(id int) string {

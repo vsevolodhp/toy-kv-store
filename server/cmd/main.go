@@ -27,6 +27,7 @@ func run(port int) error {
 	if err != nil {
 		return err
 	}
+	defer mt.Close()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{key}", handleGet(mt))

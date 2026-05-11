@@ -1,4 +1,4 @@
 server/MANIFEST
 server/sst*.json
-server/wal.db
+server/*.log
 client/*.txt

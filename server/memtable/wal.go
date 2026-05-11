@@ -7,7 +7,7 @@ import (
 	"os"
 )
 
-type logOp struct {
+type LogOp struct {
 	Op    string `json:"op"`
 	Key   string `json:"key"`
 	Value string `json:"value"`
@@ -29,7 +29,7 @@ func initWal(filename string) (*WAL, error) {
 	}, nil
 }
 
-func (wal *WAL) Log(op logOp) error {
+func (wal *WAL) Log(op LogOp) error {
 	// encode is buffered, could crash mid-write
 	if err := wal.encoder.Encode(op); err != nil {
 		return fmt.Errorf("unable to write WAL op: %w", err)
@@ -43,7 +43,7 @@ func (wal *WAL) Log(op logOp) error {
 }
 
 // Replays log entries one by one
-func (wal *WAL) ReplayLog(applyFn func(logOp)) error {
+func (wal *WAL) ReplayLog(applyFn func(LogOp)) error {
 	_, err := wal.file.Seek(0, io.SeekStart)
 	if err != nil {
 		return fmt.Errorf("unable to seek to the beginning of the file: %w", err)
@@ -51,7 +51,7 @@ func (wal *WAL) ReplayLog(applyFn func(logOp)) error {
 
 	dec := json.NewDecoder(wal.file)
 	for {
-		var op logOp
+		var op LogOp
 		err := dec.Decode(&op)
 		if err != nil {
 			if err == io.EOF {
