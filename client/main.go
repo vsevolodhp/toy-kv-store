@@ -2,12 +2,15 @@ package main
 
 import (
 	"bufio"
+	"encoding/csv"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,10 +19,10 @@ import (
 func main() {
 	lines, err := readLines("puts.txt")
 	if err != nil {
-		log.Fatal("unable to read requests: %w", err)
+		log.Fatalf("unable to read requests: %v", err)
 	}
 
-	baseUrl := "http://localhost:8080"
+	baseURL := "http://localhost:8080"
 	transport := &http.Transport{
 		MaxConnsPerHost:       10,
 		MaxIdleConns:          20,
@@ -38,54 +41,50 @@ func main() {
 		Transport: transport,
 		Timeout:   20 * time.Second,
 	}
+
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 1)
-	f, err := os.OpenFile("latency_sample.txt", os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Fatal("unable to create latency_sample: %w", err)
-	}
-	defer f.Close()
-	// TODO: use encoding/csv
-	f.WriteString("Sample,Latency_Secs\n")
+
+	latencyCh := make(chan latencyItem)
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		f, err := os.OpenFile("latency_sample.txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			log.Fatalf("unable to create latency_sample: %v", err)
+		}
+		defer f.Close()
+		w := csv.NewWriter(f)
+		w.Write([]string{"Sample", "Latency_Secs"})
+		for v := range latencyCh {
+			if err = w.Write([]string{strconv.Itoa(v.Sample), fmt.Sprintf("%.4f", v.LatencySecs)}); err != nil {
+				log.Printf("unable to log latency: %v", err)
+			}
+		}
+		w.Flush()
+	}()
 
 	for _, l := range lines {
 		wg.Add(1)
 		sem <- struct{}{}
-		switch l.method {
-		case http.MethodGet:
-			go func(l line) {
-				defer wg.Done()
-				defer func() { <-sem }()
 
-				// TODO: move to where request is actually happening
-				start := time.Now()
-				doGET(client, baseUrl, l)
-				fmt.Fprintf(f, "%d,%.4f\n", l.lineno, time.Since(start).Seconds())
-			}(l)
-		case http.MethodPut:
-			go func(l line) {
-				defer wg.Done()
-				defer func() { <-sem }()
+		go func(l line) {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-				start := time.Now()
-				doPUT(client, baseUrl, l)
-				fmt.Fprintf(f, "%d,%.4f\n", l.lineno, time.Since(start).Seconds())
-			}(l)
-		case http.MethodDelete:
-			go func(l line) {
-				defer wg.Done()
-				defer func() { <-sem }()
-
-				start := time.Now()
-				doDELETE(client, baseUrl, l)
-				fmt.Fprintf(f, "%d,%.4f\n", l.lineno, time.Since(start).Seconds())
-			}(l)
-		default:
-			<-sem
-			wg.Done()
-		}
+			switch l.method {
+			case http.MethodGet:
+				doGET(client, baseURL, l, latencyCh)
+			case http.MethodPut:
+				doPUT(client, baseURL, l, latencyCh)
+			case http.MethodDelete:
+				doDELETE(client, baseURL, l, latencyCh)
+			}
+		}(l)
 	}
 	wg.Wait()
+	close(latencyCh)
+	<-writerDone
 	log.Print("all lines have been processed")
 }
 
@@ -145,29 +144,34 @@ func parseLine(raw string) (line, error) {
 	path := "/" + fields[1]
 
 	switch method {
-	case "PUT":
-		return line{method: "PUT", path: path, payload: fields[2], raw: raw}, nil
+	case http.MethodPut:
+		return line{method: http.MethodPut, path: path, payload: fields[2], raw: raw}, nil
 
-	case "GET":
+	case http.MethodGet:
 		if fields[2] == "NOT_FOUND" {
-			return line{method: "GET", path: path, expectNotFound: true, raw: raw}, nil
+			return line{method: http.MethodGet, path: path, expectNotFound: true, raw: raw}, nil
 		}
-		return line{method: "GET", path: path, expected: fields[2], raw: raw}, nil
-	case "DELETE":
-		return line{method: "DELETE", path: path, raw: raw}, nil
+		return line{method: http.MethodGet, path: path, expected: fields[2], raw: raw}, nil
+	case http.MethodDelete:
+		return line{method: http.MethodDelete, path: path, raw: raw}, nil
 
 	default:
 		return line{}, fmt.Errorf("unsupported method %q", method)
 	}
 }
 
-func doGET(client *http.Client, baseUrl string, l line) {
-	req, err := http.NewRequest(http.MethodGet, baseUrl+l.path, nil)
+func doGET(client *http.Client, baseURL string, l line, latencyCh chan<- latencyItem) {
+	reqURL, err := url.JoinPath(baseURL, l.path)
+	if err != nil {
+		log.Printf("unable to build request URL: %v", err)
+		return
+	}
+	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
 	if err != nil {
 		log.Printf("unable to build GET request #%d: %v", l.lineno, err)
 		return
 	}
-	resp, err := doWithRetry(client, req)
+	resp, err := doWithRetry(client, req, l.lineno, latencyCh)
 	if err != nil {
 		log.Printf("request #%d failed: %v", l.lineno, err)
 		return
@@ -190,14 +194,19 @@ func doGET(client *http.Client, baseUrl string, l line) {
 	}
 }
 
-func doPUT(client *http.Client, baseUrl string, l line) {
-	req, err := http.NewRequest(http.MethodPut, baseUrl+l.path, strings.NewReader(l.payload))
+func doPUT(client *http.Client, baseURL string, l line, latencyCh chan<- latencyItem) {
+	reqURL, err := url.JoinPath(baseURL, l.path)
+	if err != nil {
+		log.Printf("unable to build request URL: %v", err)
+		return
+	}
+	req, err := http.NewRequest(http.MethodPut, reqURL, strings.NewReader(l.payload))
 	if err != nil {
 		log.Printf("unable to build PUT request #%d: %v", l.lineno, err)
 		return
 	}
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
-	resp, err := doWithRetry(client, req)
+	resp, err := doWithRetry(client, req, l.lineno, latencyCh)
 	if err != nil {
 		log.Printf("request #%d failed: %v", l.lineno, err)
 		return
@@ -214,13 +223,18 @@ func doPUT(client *http.Client, baseUrl string, l line) {
 	}
 }
 
-func doDELETE(client *http.Client, baseUrl string, l line) {
-	req, err := http.NewRequest(http.MethodDelete, baseUrl+l.path, nil)
+func doDELETE(client *http.Client, baseURL string, l line, latencyCh chan<- latencyItem) {
+	reqURL, err := url.JoinPath(baseURL, l.path)
+	if err != nil {
+		log.Printf("unable to build request URL: %v", err)
+		return
+	}
+	req, err := http.NewRequest(http.MethodDelete, reqURL, nil)
 	if err != nil {
 		log.Printf("unable to build DELETE request #%d: %v", l.lineno, err)
 		return
 	}
-	resp, err := doWithRetry(client, req)
+	resp, err := doWithRetry(client, req, l.lineno, latencyCh)
 	if err != nil {
 		log.Printf("request #%d failed: %v", l.lineno, err)
 		return
@@ -233,7 +247,7 @@ func doDELETE(client *http.Client, baseUrl string, l line) {
 	}
 }
 
-func doWithRetry(client *http.Client, req *http.Request) (*http.Response, error) {
+func doWithRetry(client *http.Client, req *http.Request, lineno int, latencyCh chan<- latencyItem) (*http.Response, error) {
 	backoffs := []time.Duration{
 		10 * time.Millisecond,
 		30 * time.Millisecond,
@@ -243,7 +257,14 @@ func doWithRetry(client *http.Client, req *http.Request) (*http.Response, error)
 	}
 	var lastErr error
 	for attempt := 0; attempt < len(backoffs)+1; attempt++ {
+		start := time.Now()
+		// TODO: there is an issue if PUT request is going to be retried
+		// the Body field is going to be already EOF after the first try
+		// either provide GetBody or build requests for each attempt
 		resp, err := client.Do(req.Clone(req.Context()))
+		end := time.Since(start).Seconds()
+		latencyCh <- latencyItem{lineno, end}
+
 		if err == nil && (resp.StatusCode < 500 || resp.StatusCode >= 600) {
 			return resp, nil
 		}
@@ -261,4 +282,9 @@ func doWithRetry(client *http.Client, req *http.Request) (*http.Response, error)
 	}
 
 	return nil, lastErr
+}
+
+type latencyItem struct {
+	Sample      int
+	LatencySecs float64
 }
