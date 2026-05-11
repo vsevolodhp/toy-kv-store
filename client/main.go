@@ -49,7 +49,7 @@ func main() {
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
-		f, err := os.OpenFile("latency_sample.txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		f, err := os.OpenFile("latency_sample.csv", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 		if err != nil {
 			log.Fatalf("unable to create latency_sample: %v", err)
 		}

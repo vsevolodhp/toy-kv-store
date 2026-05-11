@@ -2,3 +2,4 @@ server/MANIFEST
 server/sst*.json
 server/*.log
 client/*.txt
+client/*.csv
