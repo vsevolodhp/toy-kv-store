@@ -2,20 +2,24 @@ package main
 
 import (
 	"errors"
+	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
-	"fmt"
 
 	"github.com/vsevolodhp/toy-kv-store/server/memtable"
 )
 
 func main() {
-	logOpts := &slog.HandlerOptions{Level: slog.LevelDebug}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, logOpts)))
-	// TODO: pass via flags
-	if err := run(8080); err != nil {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	slog.SetDefault(logger)
+
+	port := flag.Int("port", 8080, "server port")
+	flag.Parse()
+
+	if err := run(*port); err != nil {
 		slog.Error("unable to start server", "error", err)
 		os.Exit(1)
 	}
