@@ -1,11 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"encoding/csv"
+	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,13 +16,29 @@ import (
 	"time"
 )
 
+type latencyLog struct {
+	LatencySecs float64
+	Sample      int
+}
+
 func main() {
-	lines, err := readLines("puts.txt")
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	slog.SetDefault(logger)
+
+	var (
+		serverPort        = flag.Int("targetPort", 8080, "target server port")
+		templatesFileName = flag.String("inputs", "puts.txt", "file with request templates")
+	)
+
+	flag.Parse()
+
+	reqTemplates, err := getTemplates(*templatesFileName)
 	if err != nil {
-		log.Fatalf("unable to read requests: %v", err)
+		slog.Error("unable to parse requests", "error", err)
+		os.Exit(1)
 	}
 
-	baseURL := "http://localhost:8080"
+	baseURL := fmt.Sprintf("http://localhost:%d", *serverPort)
 	transport := &http.Transport{
 		MaxConnsPerHost:       10,
 		MaxIdleConns:          20,
@@ -42,212 +58,143 @@ func main() {
 		Timeout:   20 * time.Second,
 	}
 
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 1)
-
-	latencyCh := make(chan latencyItem)
+	latencyCh := make(chan latencyLog, 10)
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
 		f, err := os.OpenFile("latency_sample.csv", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 		if err != nil {
-			log.Fatalf("unable to create latency_sample: %v", err)
+			slog.Error("unable to create latency_sample", "error", err)
+			return
 		}
 		defer f.Close()
 		w := csv.NewWriter(f)
 		w.Write([]string{"Sample", "Latency_Secs"})
 		for v := range latencyCh {
 			if err = w.Write([]string{strconv.Itoa(v.Sample), fmt.Sprintf("%.4f", v.LatencySecs)}); err != nil {
-				log.Printf("unable to log latency: %v", err)
+				slog.Error("unable to log latency", "error", err)
 			}
 		}
 		w.Flush()
 	}()
 
-	for _, l := range lines {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 1)
+
+	for _, tmplt := range reqTemplates {
 		wg.Add(1)
 		sem <- struct{}{}
 
-		go func(l line) {
+		go func(t reqTemplate) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			switch l.method {
+			switch t.method {
 			case http.MethodGet:
-				doGET(client, baseURL, l, latencyCh)
+				doGET(client, baseURL, t, latencyCh)
 			case http.MethodPut:
-				doPUT(client, baseURL, l, latencyCh)
+				doPUT(client, baseURL, t, latencyCh)
 			case http.MethodDelete:
-				doDELETE(client, baseURL, l, latencyCh)
+				doDELETE(client, baseURL, t, latencyCh)
 			}
-		}(l)
+		}(tmplt)
 	}
 	wg.Wait()
+
 	close(latencyCh)
 	<-writerDone
-	log.Print("all lines have been processed")
+
+	slog.Info("all reqTemplates have been processed")
 }
 
-type line struct {
-	method         string
-	path           string
-	payload        string
-	expected       string
-	expectNotFound bool
-	lineno         int
-	raw            string
-}
-
-func readLines(filename string) ([]line, error) {
-	f, err := os.Open(filename)
+func doGET(client *http.Client, baseURL string, tmplt reqTemplate, latencyCh chan<- latencyLog) {
+	reqURL, err := url.JoinPath(baseURL, tmplt.path)
 	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	var out []line
-	sc := bufio.NewScanner(f)
-	lineno := 0
-	for sc.Scan() {
-		lineno++
-		str := strings.TrimSpace(sc.Text())
-
-		// ignore line breaks and commented lines
-		if str == "" || strings.HasPrefix(str, "#") {
-			continue
-		}
-
-		l, err := parseLine(str)
-		l.lineno = lineno
-		if err != nil {
-			log.Printf("unable to parse line #%d: %s", lineno, err)
-			continue
-		}
-		out = append(out, l)
-	}
-	if err = sc.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func parseLine(raw string) (line, error) {
-	fields := strings.Fields(raw)
-	if len(fields) == 0 {
-		return line{}, fmt.Errorf("empty line")
-	}
-	if len(fields) < 2 {
-		return line{}, fmt.Errorf("need method and key")
-	}
-
-	method := strings.ToUpper(fields[0])
-	path := "/" + fields[1]
-
-	switch method {
-	case http.MethodPut:
-		return line{method: http.MethodPut, path: path, payload: fields[2], raw: raw}, nil
-
-	case http.MethodGet:
-		if fields[2] == "NOT_FOUND" {
-			return line{method: http.MethodGet, path: path, expectNotFound: true, raw: raw}, nil
-		}
-		return line{method: http.MethodGet, path: path, expected: fields[2], raw: raw}, nil
-	case http.MethodDelete:
-		return line{method: http.MethodDelete, path: path, raw: raw}, nil
-
-	default:
-		return line{}, fmt.Errorf("unsupported method %q", method)
-	}
-}
-
-func doGET(client *http.Client, baseURL string, l line, latencyCh chan<- latencyItem) {
-	reqURL, err := url.JoinPath(baseURL, l.path)
-	if err != nil {
-		log.Printf("unable to build request URL: %v", err)
+		slog.Error("unable to build request URL", "error", err)
 		return
 	}
 	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
 	if err != nil {
-		log.Printf("unable to build GET request #%d: %v", l.lineno, err)
+		slog.Error("unable to build GET request", "lineno", tmplt.lineno, "error", err)
 		return
 	}
-	resp, err := doWithRetry(client, req, l.lineno, latencyCh)
+	resp, err := doWithRetry(client, req, tmplt.lineno, latencyCh)
 	if err != nil {
-		log.Printf("request #%d failed: %v", l.lineno, err)
+		slog.Error("request failed", "lineno", tmplt.lineno, "error", err)
 		return
 	}
 	defer resp.Body.Close()
-	if l.expectNotFound {
+	if tmplt.expected == "NOT_FOUND" {
 		if resp.StatusCode != http.StatusNotFound {
-			log.Printf("expected: NOT_FOUND, got: %q, line: %d", resp.Status, l.lineno)
+			slog.Info("expected: NOT_FOUND", "got", resp.Status, "lineno", tmplt.lineno)
 		}
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("expected: OK, got: %q, line: %d", resp.Status, l.lineno)
+		slog.Info("expected: OK", "got", resp.Status, "lineno", tmplt.lineno)
 		return
 	}
 	body, _ := io.ReadAll(resp.Body)
 	got := string(body)
-	if got != l.expected {
-		log.Printf("expected: %q, got: %q, line: %d", l.expected, got, l.lineno)
+	if got != tmplt.expected {
+		slog.Info("unexpected result", "expected", tmplt.expected, "got", got, "lineno", tmplt.lineno)
 	}
 }
 
-func doPUT(client *http.Client, baseURL string, l line, latencyCh chan<- latencyItem) {
-	reqURL, err := url.JoinPath(baseURL, l.path)
+func doPUT(client *http.Client, baseURL string, tmplt reqTemplate, latencyCh chan<- latencyLog) {
+	reqURL, err := url.JoinPath(baseURL, tmplt.path)
 	if err != nil {
-		log.Printf("unable to build request URL: %v", err)
+		slog.Error("unable to build request URL", "error", err)
 		return
 	}
-	req, err := http.NewRequest(http.MethodPut, reqURL, strings.NewReader(l.payload))
+	req, err := http.NewRequest(http.MethodPut, reqURL, strings.NewReader(tmplt.payload))
 	if err != nil {
-		log.Printf("unable to build PUT request #%d: %v", l.lineno, err)
+		slog.Error("unable to build PUT request", "lineno", tmplt.lineno, "error", err)
 		return
 	}
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
-	resp, err := doWithRetry(client, req, l.lineno, latencyCh)
+	resp, err := doWithRetry(client, req, tmplt.lineno, latencyCh)
 	if err != nil {
-		log.Printf("request #%d failed: %v", l.lineno, err)
+		slog.Error("request failed", "lineno", tmplt.lineno, "error", err)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("expected: OK, got: %q, line: %d", resp.Status, l.lineno)
+		slog.Info("expected: OK", "got", resp.Status, "lineno", tmplt.lineno)
 		return
 	}
 	body, _ := io.ReadAll(resp.Body)
 	got := string(body)
-	if got != l.payload {
-		log.Printf("expected: %q, got: %q, line: %d", l.expected, got, l.lineno)
+	if got != tmplt.payload {
+		slog.Info("unexpected result", "expected", tmplt.expected, "got", got, "lineno", tmplt.lineno)
 	}
 }
 
-func doDELETE(client *http.Client, baseURL string, l line, latencyCh chan<- latencyItem) {
-	reqURL, err := url.JoinPath(baseURL, l.path)
+func doDELETE(client *http.Client, baseURL string, tmplt reqTemplate, latencyCh chan<- latencyLog) {
+	reqURL, err := url.JoinPath(baseURL, tmplt.path)
 	if err != nil {
-		log.Printf("unable to build request URL: %v", err)
+		slog.Error("unable to build request URL", "error", err)
 		return
 	}
 	req, err := http.NewRequest(http.MethodDelete, reqURL, nil)
 	if err != nil {
-		log.Printf("unable to build DELETE request #%d: %v", l.lineno, err)
+		slog.Error("unable to build DELETE request", "lineno", tmplt.lineno, "error", err)
 		return
 	}
-	resp, err := doWithRetry(client, req, l.lineno, latencyCh)
+	resp, err := doWithRetry(client, req, tmplt.lineno, latencyCh)
 	if err != nil {
-		log.Printf("request #%d failed: %v", l.lineno, err)
+		slog.Error("request failed", "lineno", tmplt.lineno, "error", err)
 		return
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("expected: OK, got: %q, line: %d", resp.Status, l.lineno)
+		slog.Info("expected: OK", "got", resp.Status, "lineno", tmplt.lineno)
 	}
 }
 
-func doWithRetry(client *http.Client, req *http.Request, lineno int, latencyCh chan<- latencyItem) (*http.Response, error) {
+func doWithRetry(client *http.Client, req *http.Request, lineno int, latencyCh chan<- latencyLog) (*http.Response, error) {
 	backoffs := []time.Duration{
 		10 * time.Millisecond,
 		30 * time.Millisecond,
@@ -263,7 +210,7 @@ func doWithRetry(client *http.Client, req *http.Request, lineno int, latencyCh c
 		// either provide GetBody or build requests for each attempt
 		resp, err := client.Do(req.Clone(req.Context()))
 		end := time.Since(start).Seconds()
-		latencyCh <- latencyItem{lineno, end}
+		latencyCh <- latencyLog{end, lineno}
 
 		if err == nil && (resp.StatusCode < 500 || resp.StatusCode >= 600) {
 			return resp, nil
@@ -282,9 +229,4 @@ func doWithRetry(client *http.Client, req *http.Request, lineno int, latencyCh c
 	}
 
 	return nil, lastErr
-}
-
-type latencyItem struct {
-	Sample      int
-	LatencySecs float64
 }
