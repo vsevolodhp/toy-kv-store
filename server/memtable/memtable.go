@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"sync"
+
+	"github.com/vsevolodhp/toy-kv-store/server/internal/wal"
 )
 
 // TODO:
@@ -33,12 +35,12 @@ type Entry struct {
 type Memtable struct {
 	mu        sync.RWMutex
 	data      map[string]string
-	wal       *WAL
+	wal       *wal.WAL
 	lastSSTID int
 }
 
 func New() (*Memtable, error) {
-	wal, err := initWal("wal.log")
+	w, err := wal.Open("wal.log")
 	if err != nil {
 		return nil, err
 	}
@@ -50,7 +52,7 @@ func New() (*Memtable, error) {
 
 	d := make(map[string]string, MaxSize)
 
-	err = wal.ReplayLog(func(logOp LogOp) {
+	err = w.Replay(func(logOp wal.Record) {
 		switch logOp.Op {
 		case "put":
 			d[logOp.Key] = logOp.Value
@@ -67,19 +69,17 @@ func New() (*Memtable, error) {
 
 	mt := &Memtable{
 		data:      d,
-		wal:       wal,
+		wal:       w,
 		lastSSTID: lastSSTID,
 	}
 
 	if len(d) == MaxSize {
-		err = mt.flush()
-		if err != nil {
+		if err = mt.flush(); err != nil {
 			return nil, err
 		}
 	}
 
 	return mt, nil
-
 }
 
 func (mt *Memtable) Put(key, value string) error {
@@ -90,16 +90,14 @@ func (mt *Memtable) Put(key, value string) error {
 	mt.mu.Lock()
 	defer mt.mu.Unlock()
 
-	err := mt.wal.Log(LogOp{Op: "put", Key: key, Value: value})
-	if err != nil {
+	if err := mt.wal.Append(wal.Record{Op: "put", Key: key, Value: value}); err != nil {
 		return err
 	}
 
 	mt.data[key] = value
 
 	if len(mt.data) == MaxSize {
-		err = mt.flush()
-		if err != nil {
+		if err := mt.flush(); err != nil {
 			return err
 		}
 	}
@@ -132,8 +130,7 @@ func (mt *Memtable) Get(key string) (string, error) {
 		// the file contains 2000 entries and has size ~59kb (for test inputs)
 		// for now won't use Decoder for simplicity reasons
 		entries := make([]Entry, 0, MaxSize)
-		err = json.Unmarshal(b, &entries)
-		if err != nil {
+		if err = json.Unmarshal(b, &entries); err != nil {
 			return "", fmt.Errorf("cannot unmarshal sst table content: %w", err)
 		}
 
@@ -152,8 +149,7 @@ func (mt *Memtable) Delete(key string) error {
 		return ErrEmptyKey
 	}
 
-	err := mt.wal.Log(LogOp{Op: "delete", Key: key, Value: ""})
-	if err != nil {
+	if err := mt.wal.Append(wal.Record{Op: "delete", Key: key, Value: ""}); err != nil {
 		return err
 	}
 
@@ -266,6 +262,10 @@ func getLastSSTID() (int, error) {
 		if _, err = fmt.Sscanf(line, SSTNameFmt, &lastID); err != nil {
 			return 0, fmt.Errorf("cannot parse sst id: %w", err)
 		}
+	}
+
+	if err = scanner.Err(); err != nil {
+		return 0, fmt.Errorf("manifest scan failed: %w", err)
 	}
 	return lastID, nil
 }
