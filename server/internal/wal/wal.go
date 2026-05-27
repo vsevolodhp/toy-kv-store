@@ -24,7 +24,7 @@ func Open(path string) (*WAL, error) {
 		return nil, fmt.Errorf("failed to open wal: %w", err)
 	}
 	return &WAL{
-		file: f, 
+		file: f,
 	}, nil
 }
 

@@ -1,16 +1,12 @@
 package memtable
 
 import (
-	"bufio"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"slices"
-	"strings"
 	"sync"
 
+	"github.com/vsevolodhp/toy-kv-store/server/internal/sst"
 	"github.com/vsevolodhp/toy-kv-store/server/internal/wal"
 )
 
@@ -23,7 +19,7 @@ var (
 )
 
 const (
-	MaxSize    = 2_000
+	MaxSize    = 200 // TODO: upd to 2k later
 	SSTNameFmt = "sst-%d.json"
 )
 
@@ -33,10 +29,10 @@ type Entry struct {
 }
 
 type Memtable struct {
-	mu        sync.RWMutex
-	data      map[string]string
-	wal       *wal.WAL
-	lastSSTID int
+	mu         sync.RWMutex
+	data       map[string]string
+	wal        *wal.WAL
+	sstManager *sst.Manager
 }
 
 func New() (*Memtable, error) {
@@ -45,9 +41,9 @@ func New() (*Memtable, error) {
 		return nil, err
 	}
 
-	lastSSTID, err := getLastSSTID()
+	sstMngr, err := sst.New()
 	if err != nil {
-		return nil, fmt.Errorf("unable to get SST ID: %w", err)
+		return nil, err
 	}
 
 	d := make(map[string]string, MaxSize)
@@ -68,9 +64,9 @@ func New() (*Memtable, error) {
 	}
 
 	mt := &Memtable{
-		data:      d,
-		wal:       w,
-		lastSSTID: lastSSTID,
+		data:       d,
+		wal:        w,
+		sstManager: sstMngr,
 	}
 
 	if len(d) == MaxSize {
@@ -118,29 +114,7 @@ func (mt *Memtable) Get(key string) (string, error) {
 		return v, nil
 	}
 
-	// TODO: the lastSSTID in memtable and MANIFEST can become inconsistent
-	for i := mt.lastSSTID; i >= 1; i-- {
-		sstName := getSSTName(i)
-
-		b, err := os.ReadFile(sstName)
-		if err != nil {
-			return "", fmt.Errorf("cannot read SST table: %w", err)
-		}
-
-		// the file contains 2000 entries and has size ~59kb (for test inputs)
-		// for now won't use Decoder for simplicity reasons
-		entries := make([]Entry, 0, MaxSize)
-		if err = json.Unmarshal(b, &entries); err != nil {
-			return "", fmt.Errorf("cannot unmarshal sst table content: %w", err)
-		}
-
-		for _, e := range entries {
-			if e.Key == key {
-				return e.Value, nil
-			}
-		}
-	}
-
+	// TODO: search in sst
 	return "", ErrKeyNotFound
 }
 
@@ -162,110 +136,23 @@ func (mt *Memtable) Delete(key string) error {
 }
 
 func (mt *Memtable) flush() error {
-	entries := make([]Entry, 0, MaxSize)
+	entries := make([]sst.TableEntry, 0, MaxSize)
 	for k, v := range mt.data {
-		entries = append(entries, Entry{k, v})
-	}
-	slices.SortFunc(entries, func(a, b Entry) int {
-		return strings.Compare(a.Key, b.Key)
-	})
-
-	sst, err := json.Marshal(entries)
-	if err != nil {
-		return fmt.Errorf("unable to marshal: %w", err)
+		entries = append(entries, sst.TableEntry{
+			Key:   k,
+			Value: v,
+		})
 	}
 
-	sstName := getSSTName(mt.lastSSTID + 1)
-	// use current dir for both MANIFEST and SST
-	dir, err := os.Open(".")
-	if err != nil {
-		return fmt.Errorf("unable to open parent dir: %w", err)
-	}
-	defer dir.Close()
-
-	if err = os.WriteFile(sstName, sst, 0644); err != nil {
-		return fmt.Errorf("unable to flush: %w", err)
-	}
-
-	if err = dir.Sync(); err != nil {
-		return fmt.Errorf("unable to sync parent dir: %w", err)
-	}
-
-	manifest, err := os.ReadFile("MANIFEST")
-	if err != nil {
-		return fmt.Errorf("unable to open MANIFEST: %w", err)
-	}
-	manifest = slices.Concat(manifest, []byte(sstName+"\n"))
-
-	tmpManifest, err := os.OpenFile("MANIFEST.tmp", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return fmt.Errorf("unable to create temp MANIFEST file: %w", err)
-	}
-	defer func() {
-		if tmpManifest != nil {
-			// if error happened before and we didn't manually close
-			// we will still try to call Close and remove tmp file
-			tmpManifest.Close()
-			os.Remove("MANIFEST.tmp")
-		}
-	}()
-
-	if _, err = tmpManifest.Write(manifest); err != nil {
-		return fmt.Errorf("unable to write to temp MANIFEST: %w", err)
-	}
-	if err = tmpManifest.Sync(); err != nil {
-		return fmt.Errorf("unable to sync temp MANIFEST: %w", err)
-	}
-	if err = tmpManifest.Close(); err != nil {
-		return fmt.Errorf("unable to close MANIFEST.tmp: %w", err)
-	}
-	tmpManifest = nil
-
-	if err = os.Rename("MANIFEST.tmp", "MANIFEST"); err != nil {
-		return fmt.Errorf("unable to rename MANIFEST.tmp: %w", err)
-	}
-	if err = dir.Sync(); err != nil {
-		return fmt.Errorf("unable to sync parent dir: %w", err)
-	}
-
-	mt.lastSSTID++
-	clear(mt.data)
-
-	if err = mt.wal.Truncate(); err != nil {
+	if err := mt.sstManager.Write(entries); err != nil {
 		return err
 	}
 
-	return nil
+	clear(mt.data)
+
+	return mt.wal.Truncate()
 }
 
 func (m *Memtable) Close() {
 	m.wal.Close()
-}
-
-func getSSTName(id int) string {
-	return fmt.Sprintf(SSTNameFmt, id)
-}
-
-// Reads MANIFEST and returns last SST ID
-func getLastSSTID() (int, error) {
-	f, err := os.OpenFile("MANIFEST", os.O_CREATE|os.O_RDONLY, 0644)
-	if err != nil {
-		return 0, fmt.Errorf("unable to read MANIFEST: %w", err)
-	}
-	defer f.Close()
-
-	// TODO: should I be doing at all?
-	scanner := bufio.NewScanner(f)
-	var lastID int
-	for scanner.Scan() {
-		line := scanner.Text()
-		if _, err = fmt.Sscanf(line, SSTNameFmt, &lastID); err != nil {
-			return 0, fmt.Errorf("cannot parse sst id: %w", err)
-		}
-	}
-
-	if err = scanner.Err(); err != nil {
-		return 0, fmt.Errorf("manifest scan failed: %w", err)
-	}
-	return lastID, nil
 }
