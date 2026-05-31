@@ -13,13 +13,9 @@ import (
 // TODO:
 // - Implement LRU Negative Cache (no disk scans for repeatedly non-existent keys)
 
-var (
-	ErrKeyNotFound = errors.New("key not found")
-	ErrEmptyKey    = errors.New("empty key")
-)
+var ErrEmptyKey = errors.New("empty key")
 
 const (
-	MaxSize    = 200 // TODO: upd to 2k later
 	SSTNameFmt = "sst-%d.json"
 )
 
@@ -46,7 +42,7 @@ func New() (*Memtable, error) {
 		return nil, err
 	}
 
-	d := make(map[string]string, MaxSize)
+	d := make(map[string]string, sst.TableSize)
 
 	err = w.Replay(func(logOp wal.Record) {
 		switch logOp.Op {
@@ -69,7 +65,7 @@ func New() (*Memtable, error) {
 		sstManager: sstMngr,
 	}
 
-	if len(d) == MaxSize {
+	if len(d) == sst.TableSize {
 		if err = mt.flush(); err != nil {
 			return nil, err
 		}
@@ -92,7 +88,7 @@ func (mt *Memtable) Put(key, value string) error {
 
 	mt.data[key] = value
 
-	if len(mt.data) == MaxSize {
+	if len(mt.data) == sst.TableSize {
 		if err := mt.flush(); err != nil {
 			return err
 		}
@@ -114,8 +110,7 @@ func (mt *Memtable) Get(key string) (string, error) {
 		return v, nil
 	}
 
-	// TODO: search in sst
-	return "", ErrKeyNotFound
+	return mt.sstManager.Seek(key)
 }
 
 func (mt *Memtable) Delete(key string) error {
@@ -136,7 +131,7 @@ func (mt *Memtable) Delete(key string) error {
 }
 
 func (mt *Memtable) flush() error {
-	entries := make([]sst.TableEntry, 0, MaxSize)
+	entries := make([]sst.TableEntry, 0, sst.TableSize)
 	for k, v := range mt.data {
 		entries = append(entries, sst.TableEntry{
 			Key:   k,

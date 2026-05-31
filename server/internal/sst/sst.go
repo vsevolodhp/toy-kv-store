@@ -3,13 +3,19 @@ package sst
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
 	"strings"
 )
 
-const ManifestPath = "MANIFEST"
+const (
+	manifestPath = "MANIFEST"
+	TableSize    = 200
+)
+
+var ErrKeyNotFound = errors.New("key not found")
 
 type Manager struct {
 	activeTables []string
@@ -21,7 +27,7 @@ type TableEntry struct {
 }
 
 func New() (*Manager, error) {
-	f, err := os.OpenFile(ManifestPath, os.O_RDONLY|os.O_CREATE, 0644)
+	f, err := os.OpenFile(manifestPath, os.O_RDONLY|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("sst: failed to create MANIFEST: %w", err)
 	}
@@ -81,7 +87,7 @@ func (m *Manager) Write(entries []TableEntry) error {
 	}
 
 	// update manifest atomically
-	tmp, err := os.OpenFile(ManifestPath+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC|os.O_APPEND, 0644)
+	tmp, err := os.OpenFile(manifestPath+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("sst: failed to create tmp MANIFEST: %w", err)
 	}
@@ -105,7 +111,7 @@ func (m *Manager) Write(entries []TableEntry) error {
 	}
 	tmp.Close() // close before rename
 	isTmpClosed = true
-	if err := os.Rename(tmp.Name(), ManifestPath); err != nil {
+	if err := os.Rename(tmp.Name(), manifestPath); err != nil {
 		return fmt.Errorf("sst: failed to update MANIFEST: %w", err)
 	}
 	if err := dir.Sync(); err != nil {
@@ -116,4 +122,47 @@ func (m *Manager) Write(entries []TableEntry) error {
 	m.activeTables = append(m.activeTables, filename)
 
 	return nil
+}
+
+func (m *Manager) Seek(key string) (string, error) {
+	if len(m.activeTables) == 0 {
+		return "", ErrKeyNotFound
+	}
+
+	// new tables appended to activeTables, for search prioritize newest tables
+	for _, filename := range slices.Backward(m.activeTables) {
+		value, err := fileSeek(filename, key)
+		if err != nil {
+			if errors.Is(err, ErrKeyNotFound) {
+				// continue search in other files
+				continue
+			}
+			return "", err
+		}
+		return value, nil
+	}
+
+	return "", ErrKeyNotFound
+}
+
+func fileSeek(filename, key string) (string, error) {
+	d, err := os.ReadFile(filename) // sst table is small in this project (< 60KB), so read in memory for simplicity
+	if err != nil {
+		return "", fmt.Errorf("sst: unable to read table: %w", err)
+	}
+
+	entries := make([]TableEntry, 0, TableSize)
+	if err := json.Unmarshal(d, &entries); err != nil {
+		return "", fmt.Errorf("sst: failed to unmarshal table: %w", err)
+	}
+
+	idx, found := slices.BinarySearchFunc(entries, key, func(entry TableEntry, k string) int {
+		return strings.Compare(entry.Key, k)
+	})
+
+	if found {
+		return entries[idx].Value, nil
+	}
+
+	return "", ErrKeyNotFound
 }

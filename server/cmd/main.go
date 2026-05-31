@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/vsevolodhp/toy-kv-store/server/internal/sst"
 	"github.com/vsevolodhp/toy-kv-store/server/memtable"
 )
 
@@ -53,7 +54,7 @@ func handleGet(mt *memtable.Memtable) http.HandlerFunc {
 			http.Error(w, "key cannot be empty", http.StatusBadRequest)
 			return
 		}
-		if errors.Is(err, memtable.ErrKeyNotFound) {
+		if errors.Is(err, sst.ErrKeyNotFound) {
 			http.Error(w, "key not found", http.StatusNotFound)
 			return
 		}
