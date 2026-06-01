@@ -10,19 +10,10 @@ import (
 	"github.com/vsevolodhp/toy-kv-store/server/internal/wal"
 )
 
-// TODO:
-// - Implement LRU Negative Cache (no disk scans for repeatedly non-existent keys)
+// Use of \x00 (null byte seq) to minize chance of collision
+const Tombstone = "\x00TOMBSTONE\x00"
 
 var ErrEmptyKey = errors.New("empty key")
-
-const (
-	SSTNameFmt = "sst-%d.json"
-)
-
-type Entry struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
-}
 
 type Memtable struct {
 	mu         sync.RWMutex
@@ -49,7 +40,7 @@ func New() (*Memtable, error) {
 		case "put":
 			d[logOp.Key] = logOp.Value
 		case "delete":
-			delete(d, logOp.Key)
+			d[logOp.Key] = Tombstone
 		default:
 			slog.Error("unspported log operation", slog.String("operation", logOp.Op))
 		}
@@ -107,6 +98,9 @@ func (mt *Memtable) Get(key string) (string, error) {
 
 	v, ok := mt.data[key]
 	if ok {
+		if v == Tombstone {
+			return "", sst.ErrKeyDeleted
+		}
 		return v, nil
 	}
 
@@ -117,25 +111,27 @@ func (mt *Memtable) Delete(key string) error {
 	if key == "" {
 		return ErrEmptyKey
 	}
+	mt.mu.Lock()
+	defer mt.mu.Unlock()
 
 	if err := mt.wal.Append(wal.Record{Op: "delete", Key: key, Value: ""}); err != nil {
 		return err
 	}
-
-	mt.mu.Lock()
-	defer mt.mu.Unlock()
-
-	// TODO: delete from sst tables as well
-	delete(mt.data, key)
+	mt.data[key] = Tombstone
 	return nil
 }
 
 func (mt *Memtable) flush() error {
 	entries := make([]sst.TableEntry, 0, sst.TableSize)
 	for k, v := range mt.data {
+		isDeleted := v == Tombstone
+		if isDeleted {
+			v = ""
+		}
 		entries = append(entries, sst.TableEntry{
-			Key:   k,
-			Value: v,
+			Key:     k,
+			Value:   v,
+			Deleted: isDeleted,
 		})
 	}
 
@@ -148,6 +144,6 @@ func (mt *Memtable) flush() error {
 	return mt.wal.Truncate()
 }
 
-func (m *Memtable) Close() {
-	m.wal.Close()
+func (m *Memtable) Close() error {
+	return m.wal.Close()
 }

@@ -54,7 +54,7 @@ func handleGet(mt *memtable.Memtable) http.HandlerFunc {
 			http.Error(w, "key cannot be empty", http.StatusBadRequest)
 			return
 		}
-		if errors.Is(err, sst.ErrKeyNotFound) {
+		if errors.Is(err, sst.ErrKeyNotFound) || errors.Is(err, sst.ErrKeyDeleted) {
 			http.Error(w, "key not found", http.StatusNotFound)
 			return
 		}

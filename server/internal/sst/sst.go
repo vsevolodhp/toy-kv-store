@@ -15,15 +15,19 @@ const (
 	TableSize    = 200
 )
 
-var ErrKeyNotFound = errors.New("key not found")
+var (
+	ErrKeyNotFound = errors.New("key not found")
+	ErrKeyDeleted  = errors.New("key is deleted")
+)
 
 type Manager struct {
 	activeTables []string
 }
 
 type TableEntry struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
+	Key     string `json:"key"`
+	Value   string `json:"value"`
+	Deleted bool   `json:"deleted"`
 }
 
 func New() (*Manager, error) {
@@ -161,6 +165,9 @@ func fileSeek(filename, key string) (string, error) {
 	})
 
 	if found {
+		if entries[idx].Deleted {
+			return "", ErrKeyDeleted
+		}
 		return entries[idx].Value, nil
 	}
 
