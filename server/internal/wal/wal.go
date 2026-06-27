@@ -13,9 +13,16 @@ type Record struct {
 	Value string `json:"value"`
 }
 
+type logFile interface {
+	io.ReadWriteCloser
+	io.Seeker
+
+	Sync() error
+	Truncate(int64) error
+}
+
 type WAL struct {
-	// TODO: consider to use interface instead
-	file *os.File
+	file logFile
 }
 
 func Open(path string) (*WAL, error) {
