@@ -45,7 +45,7 @@ func getTemplates(filename string) ([]reqTemplate, error) {
 		out = append(out, template)
 	}
 
-	if err = s.Err(); err != nil {
+	if err := s.Err(); err != nil {
 		return nil, fmt.Errorf("failed to read req templates: %w", err)
 	}
 	return out, nil
